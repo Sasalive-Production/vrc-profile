@@ -1,0 +1,14 @@
+name = "profile"
+main = "build/worker/shim.mjs"
+compatibility_date = "2023-06-28"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[[kv_namespaces]]
+binding = "authstore"
+id = "618663e30ee945fdbbfc3e21307a7fdc"
+
+[[routes]]
+pattern = "p.nekok500.com/*"
+zone_id = "265b017b4ca92ecc876c85bf935995fe"
