@@ -144,12 +144,7 @@ impl User for GetUser {
         &self.display_name
     }
     fn emoji(&self) -> String {
-        match self.state {
-            State::Online => status_emoji(&self.status),
-            State::Active => "\u{1F310}",
-            State::Offline => "\u{26AB}",
-        }
-        .to_string()
+        status_emoji(&self.status).to_string()
     }
     fn id(&self) -> &String {
         &self.id
