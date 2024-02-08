@@ -1,7 +1,7 @@
 use regex::Regex;
 use std::collections::HashMap;
 use vrc::*;
-use worker::*;
+use worker::{Result, *};
 
 mod vrc;
 

@@ -3,9 +3,46 @@ use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 use serde_enum_str::{Deserialize_enum_str, Serialize_enum_str};
 use std::collections::HashMap;
+use thiserror::Error;
 use totp_rs::{Secret, TOTP};
 use wasm_timer::{SystemTime, UNIX_EPOCH};
 use worker::{kv::KvStore, *};
+
+pub type Result<T> = core::result::Result<T, VRCError>;
+
+#[derive(Debug, Error)]
+pub enum VRCError {
+    #[error("totp was requested but no secret was provided")]
+    NoTotpSecret,
+    #[error("worker error")]
+    WorkerError(#[from] worker::Error),
+    #[error("login failed with status: {0}")]
+    LoginFailed(u16),
+    #[error("totp verify failed")]
+    TotpVerifyFailed,
+    #[error("totp unavailable")]
+    TotpUnavailable,
+    #[error("serde error")]
+    SerdeError(#[from] serde_json::Error),
+    #[error("failed with totp endpoint")]
+    TotpFailed(Response),
+    #[error("auth cookie was missing")]
+    NoAuthCookie,
+    #[error("two factor cookie was missing")]
+    NoTwoFactorCookie,
+    #[error("url parse failed")]
+    UrlParseError(#[from] url::ParseError),
+    #[error("failed request: {0}")]
+    RequestFailed(String),
+    #[error("missing credentials")]
+    MissingCredentials,
+}
+
+impl From<VRCError> for worker::Error {
+    fn from(value: VRCError) -> Self {
+        worker::Error::RustError(format!("{}", value))
+    }
+}
 
 #[derive(Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -264,8 +301,8 @@ impl VRCApi {
         let mut resp = Fetch::Request(req).send().await?;
 
         if resp.status_code() != 200 {
-            console_log!("auth failed. headers: {:?} ", resp.headers());
-            return Err(format!("error with login endpoint: {}", resp.text().await?).into());
+            console_log!("login failed. headers: {:?} ", resp.headers());
+            return Err(VRCError::LoginFailed(resp.status_code()));
         }
 
         if let Some(set_cookie) = resp.headers().get("set-cookie")? {
@@ -283,10 +320,10 @@ impl VRCApi {
         if let Some(twofactor_methods) = login_resp.requires_two_factor_auth {
             if twofactor_methods.contains(&TwoFactorType::Totp) {
                 if !self.totp_auth().await? {
-                    return Err("totp authentication failed".into());
+                    return Err(VRCError::TotpVerifyFailed);
                 }
             } else {
-                return Err("totp is unavailable".into());
+                return Err(VRCError::TotpUnavailable);
             }
         };
 
@@ -294,21 +331,17 @@ impl VRCApi {
     }
 
     pub async fn totp_auth(self: &mut Self) -> Result<bool> {
-        let totp = self
-            .totp
-            .as_ref()
-            .ok_or("totp was requested but no secret was provided")?;
+        let totp = self.totp.as_ref().ok_or(VRCError::NoTotpSecret)?;
 
         // console_log!("{}", totp.generate().map_err(|e: std::time::SystemTimeError| e.to_string())?);
         let totp_body = serde_json::to_string(&Verify2FA {
             code: totp.generate(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map_err(|_| "system time error")?
+                    .unwrap()
                     .as_secs(),
             ),
-        })
-        .map_err(|e| e.to_string())?;
+        })?;
 
         let totp_req = Request::new_with_init(
             "https://api.vrchat.cloud/api/1/auth/twofactorauth/totp/verify",
@@ -321,7 +354,7 @@ impl VRCApi {
 
         if totp_resp.status_code() != 200 {
             console_log!("two factor failed. headers: {:?} ", totp_resp.headers());
-            return Err(format!("error with totp endpoint: {}", totp_resp.text().await?).into());
+            return Err(VRCError::TotpFailed(totp_resp));
         }
 
         if !totp_resp.json::<Verify2FAResponse>().await?.verified {
@@ -335,12 +368,12 @@ impl VRCApi {
                     totp_resp
                         .headers()
                         .get("set-cookie")?
-                        .ok_or("failed to get set-cookie header")?
+                        .ok_or(VRCError::NoAuthCookie)?
                         .as_str(),
                 )
                 .unwrap()
                 .get(1)
-                .ok_or("failed to get twoFactorAuth cookie")?
+                .ok_or(VRCError::NoTwoFactorCookie)?
                 .as_str()
                 .to_owned(),
         );
@@ -361,12 +394,17 @@ impl VRCApi {
         )?;
         let mut resp = Fetch::Request(req).send().await?;
 
-        if resp.status_code() != 200 {
-            console_log!("{}, {:?}", resp.text().await?, self.headers());
-            return Err(format!("unexpect status: {}", resp.status_code()).into());
+        match resp.status_code() {
+            200 => Ok(resp.json::<SearchUserResp>().await?),
+            401 => Err(VRCError::MissingCredentials),
+            _ => {
+                console_error!("{}", resp.text().await?);
+                Err(VRCError::RequestFailed(format!(
+                    "unexcept status with: {}",
+                    resp.status_code()
+                )))
+            }
         }
-
-        resp.json::<SearchUserResp>().await
     }
 
     pub async fn get_user_by_id(self: &Self, id: &String) -> Result<Option<GetUser>> {
@@ -379,16 +417,21 @@ impl VRCApi {
         let mut resp = Fetch::Request(req).send().await?;
 
         match resp.status_code() {
-            200 => resp.json::<Option<GetUser>>().await,
+            200 => Ok(resp.json::<Option<GetUser>>().await?),
+            401 => Err(VRCError::MissingCredentials),
             404 => Ok(None),
             _ => {
                 console_log!("{}, {:?}", resp.text().await?, self.headers());
-                Err(format!("unexpect status: {}", resp.status_code()).into())
+                Err(VRCError::RequestFailed("unexcept status".into()))
             }
         }
     }
 
-    pub async fn with_kv(kv: KvStore, credentials: String, totp: Option<TOTP>) -> Result<Self> {
+    pub async fn with_kv(
+        kv: KvStore,
+        credentials: String,
+        totp: Option<TOTP>,
+    ) -> worker::Result<Self> {
         return Ok(match kv.get("vrcapi_client").text().await? {
             Some(client_data) => {
                 let mut client = serde_json::from_str::<VRCApi>(client_data.as_str())?;
@@ -415,7 +458,7 @@ impl VRCApi {
         });
     }
 
-    pub async fn with_context(ctx: RouteContext<()>) -> Result<Self> {
+    pub async fn with_context(ctx: RouteContext<()>) -> worker::Result<Self> {
         let totp = match ctx.var("totp_secret") {
             Ok(totp) => Some(
                 TOTP::new(
